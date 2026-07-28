@@ -216,3 +216,5 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+./pioneer_web_ide_sim_v30
+./DS_Store
