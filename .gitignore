@@ -217,4 +217,9 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 ./pioneer_web_ide_sim_v30
-./DS_Store
+./.DS_Store
+.DS_Store
+pioneer_web_ide_sim_v30/.
+./pioneer_web_ide_sim_v30/..
+/pioneer_web_ide_sim_v30/
+pioneer_web_ide_sim_v30/ы

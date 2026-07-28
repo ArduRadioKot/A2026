@@ -1,0 +1,247 @@
+import time
+import threading
+import cv2
+
+from pioneer_sdk2 import Pioneer
+from pioneer_sdk2 import Camera
+from pioneer_sdk2 import ImageViewer
+from pioneer_sdk2 import ServoCamera
+
+# ============================================================
+# НАСТРОЙКИ
+# ============================================================
+
+STREAM_NAME = "pioneer"
+
+running = True
+servo_camera = ServoCamera()
+
+servo_camera.set_angle(-80)
+
+# ============================================================
+# ВИДЕО ПОТОК
+# ============================================================
+
+def video_worker():
+
+    global running
+
+    camera = None
+    viewer = None
+
+
+    try:
+
+        print("[VIDEO] Подключение камеры...")
+
+
+        camera = Camera()
+
+
+        viewer = ImageViewer()
+
+
+        print()
+        print("=" * 50)
+        print("Видеопоток запущен")
+        print()
+        print(
+            "Открой в браузере:"
+        )
+        print(
+            f"http://10.42.0.1:8889/{STREAM_NAME}"
+        )
+        print("=" * 50)
+        print()
+
+
+
+        while running:
+
+
+            frame = camera.get_cv_frame(
+                timeout=2.0
+            )
+
+
+            if frame is None:
+
+                print(
+                    "[VIDEO] Нет кадра"
+                )
+
+                continue
+
+
+
+            # Информация на изображении
+
+            cv2.putText(
+                frame,
+                "PIONEER CAMERA",
+                (20,40),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1,
+                (0,255,0),
+                2
+            )
+
+
+            # отправка в веб
+
+            viewer.imshow(
+                STREAM_NAME,
+                frame,
+                fps=20
+            )
+
+
+
+    except Exception as e:
+
+
+        print(
+            "[VIDEO ERROR]",
+            e
+        )
+
+
+
+    finally:
+
+
+        print(
+            "[VIDEO] Остановка"
+        )
+
+
+        try:
+
+            camera.stop()
+
+        except:
+
+            pass
+
+
+        try:
+
+            viewer.close()
+
+        except:
+
+            pass
+
+
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+pioneer = None
+
+
+try:
+
+
+    print(
+        "Подключение к Pioneer..."
+    )
+
+
+    pioneer = Pioneer()
+
+
+    print(
+        "Pioneer подключен"
+    )
+
+
+
+    # запуск камеры
+
+    video_thread = threading.Thread(
+        target=video_worker,
+        daemon=True
+    )
+
+
+    video_thread.start()
+
+
+
+    print(
+        "Камера работает"
+    )
+
+
+    print(
+        "Для выхода нажмите CTRL+C"
+    )
+
+
+
+    while True:
+
+
+        # вывод позиции (если аппарат уже в воздухе)
+
+        try:
+
+            pos = pioneer.get_local_position_lps()
+
+            if pos:
+
+                print(
+                    "Позиция:",
+                    [
+                        round(v,2)
+                        for v in pos
+                    ]
+                )
+
+
+        except:
+
+            pass
+
+
+
+        time.sleep(1)
+
+
+
+except KeyboardInterrupt:
+
+
+    print(
+        "\nОстановка оператором"
+    )
+
+
+
+finally:
+
+
+    running = False
+
+
+    time.sleep(1)
+
+
+    if pioneer:
+
+        try:
+
+            pioneer.close_connection()
+
+        except:
+
+            pass
+
+
+
+    print(
+        "Программа завершена"
+    )
