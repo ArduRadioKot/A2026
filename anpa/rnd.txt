@@ -1,0 +1,452 @@
+#!/usr/bin/env python3
+
+import time
+import cv2
+import numpy as np
+import rospy
+import threading
+
+from sensor_msgs.msg import Image
+from cv_bridge import CvBridge
+from user.library import DroneLibrary
+from flask import Flask, Response
+
+
+# ============================================================
+# ВЕБ-СЕРВЕР ДЛЯ ВИДЕОПОТОКА (FLASK)
+# ============================================================
+app = Flask(__name__)
+frame_lock = threading.Lock()
+latest_frame_for_web = None
+system_status = "Инициализация"  # Статус для отображения на видео
+
+def process_frame_for_display(frame):
+    """
+    Обрабатывает кадр для отображения в браузере:
+    - Рисует рамку вокруг кубика
+    - Выводит координаты и размер
+    - Показывает статус системы
+    - Отмечает ROI для лазера
+    """
+    if frame is None:
+        return None
+    
+    # Копируем кадр, чтобы не портить оригинал
+    display_frame = frame.copy()
+    
+    # 1. Детекция кубика для отрисовки
+    detection = detect_cube(display_frame)
+    
+    if detection is not None:
+        x, y, w, h = detection["x"], detection["y"], detection["w"], detection["h"]
+        cx, cy = detection["cx"], detection["cy"]
+        area = detection["area"]
+        
+        # Рисуем зеленый прямоугольник вокруг кубика
+        cv2.rectangle(display_frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+        
+        # Рисуем точку в центре
+        cv2.circle(display_frame, (int(cx), int(cy)), 5, (0, 0, 255), -1)
+        
+        # Выводим информацию об объекте
+        info_text = f"Object: ({int(cx)}, {int(cy)}) {w}x{h} Area:{int(area)}"
+        cv2.putText(display_frame, info_text, (10, 30), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+    else:
+        cv2.putText(display_frame, "No object detected", (10, 30), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+    
+    # 2. Отмечаем ROI для лазерного детектора (центр кадра)
+    h, w = display_frame.shape[:2]
+    roi_size = min(h, w) // 6
+    cx, cy = w // 2, h // 2
+    cv2.rectangle(display_frame, (cx - roi_size, cy - roi_size), 
+                  (cx + roi_size, cy + roi_size), (255, 0, 255), 1)
+    cv2.putText(display_frame, "Laser ROI", (cx - roi_size, cy - roi_size - 5), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
+    
+    # 3. Вычисляем среднюю яркость в ROI
+    roi = display_frame[cy-roi_size:cy+roi_size, cx-roi_size:cx+roi_size]
+    gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    brightness = float(np.mean(gray_roi))
+    
+    # Индикатор яркости
+    bright_color = (0, 255, 0) if brightness > 180 else (0, 0, 255)
+    cv2.putText(display_frame, f"Brightness: {brightness:.0f}", (10, 50), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, bright_color, 1)
+    
+    # 4. Статус системы (в правом верхнем углу)
+    status_color = (0, 255, 0) if system_status == "КУБИК НАЙДЕН" else (255, 255, 0)
+    cv2.putText(display_frame, f"Status: {system_status}", (w - 200, 30), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, status_color, 2)
+    
+    # 5. Разрешение кадра (в правом нижнем углу)
+    cv2.putText(display_frame, f"{w}x{h}", (w - 80, h - 10), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+    
+    return display_frame
+
+
+def generate_frames():
+    """Генератор кадров для MJPEG потока в браузер"""
+    global latest_frame_for_web
+    while True:
+        with frame_lock:
+            if latest_frame_for_web is not None:
+                frame_copy = latest_frame_for_web.copy()
+            else:
+                frame_copy = None
+        
+        if frame_copy is not None:
+            # Обрабатываем кадр (рисуем рамки, текст и т.д.)
+            processed_frame = process_frame_for_display(frame_copy)
+            
+            if processed_frame is not None:
+                # Сжимаем в JPEG (качество 70% для баланса скорость/четкость)
+                ret, buffer = cv2.imencode('.jpg', processed_frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                if ret:
+                    yield (b'--frame\r\n'
+                           b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+        time.sleep(0.05)  # ~20 FPS
+
+@app.route('/video')
+def video_feed():
+    return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+def start_web_server():
+    app.run(host='0.0.0.0', port=5000, threaded=True, use_reloader=False)
+
+
+# ============================================================
+# НАСТРОЙКИ ЦВЕТА И КАМЕРЫ
+# ============================================================
+LOWER_HSV = np.array([15, 80, 80])
+UPPER_HSV = np.array([40, 255, 255])
+
+IMG_W = 320
+IMG_H = 240
+IMG_CX = IMG_W // 2       # 160
+IMG_CY = IMG_H // 2       # 120
+
+
+# ============================================================
+# НАСТРОЙКИ ПОИСКА
+# ============================================================
+SEARCH_DEPTH = 0.35
+SEARCH_PITCH = -15
+SEARCH_SPEED = 25
+APPROACH_SPEED = 15
+LANES = 5
+LONG_TIME = 12.0
+SHIFT_TIME = 2.0
+
+MIN_AREA = 40
+STOP_BOX_SIZE = 70
+LOCK_FRAMES = 3
+
+YAW_KP = 20.0
+MAX_YAW_CORRECTION = 15.0
+
+bridge = CvBridge()
+latest_frame = None
+latest_frame_time = 0.0
+
+
+# ============================================================
+# ФУНКЦИИ ЛАЗЕРА (КОД МОРЗЕ)
+# ============================================================
+def blink_laser(drone, duration):
+    drone.set_laser(1)
+    time.sleep(duration)
+    drone.set_laser(0)
+
+def send_dot(drone):
+    blink_laser(drone, 0.3)
+    time.sleep(0.2)
+
+def send_dash(drone):
+    blink_laser(drone, 0.9)
+    time.sleep(0.2)
+
+def send_number(drone, number):
+    morse_numbers = {
+        '0': '-----', '1': '.----', '2': '..---', '3': '...--', '4': '....-',
+        '5': '.....', '6': '-....', '7': '--...', '8': '---..', '9': '----.'
+    }
+    rospy.loginfo(f'Отправка цифры {number} лазером...')
+    code = morse_numbers.get(str(number), '')
+    
+    for symbol in code:
+        if rospy.is_shutdown():
+            break
+        if symbol == '.':
+            send_dot(drone)
+        elif symbol == '-':
+            send_dash(drone)
+        time.sleep(0.3)
+    time.sleep(1)
+
+
+# ============================================================
+# ROS CAMERA
+# ============================================================
+def camera_callback(msg):
+    global latest_frame, latest_frame_time, latest_frame_for_web
+    try:
+        frame = bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+        
+        latest_frame = frame
+        latest_frame_time = time.time()
+        
+        with frame_lock:
+            latest_frame_for_web = frame
+            
+    except Exception as exc:
+        print("Ошибка камеры:", exc)
+
+
+# ============================================================
+# HSV ДЕТЕКТОР
+# ============================================================
+def detect_cube(img):
+    if img is None:
+        return None
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, LOWER_HSV, UPPER_HSV)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    best, best_area = None, 0
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area < MIN_AREA:
+            continue
+        if area > best_area:
+            best_area = area
+            best = contour
+
+    if best is None:
+        return None
+
+    x, y, w, h = cv2.boundingRect(best)
+    return {"cx": x + w / 2, "cy": y + h / 2, "area": best_area, "x": x, "y": y, "w": w, "h": h}
+
+
+# ============================================================
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ============================================================
+def normalize_course(course):
+    while course >= 360: course -= 360
+    while course < 0: course += 360
+    return course
+
+def clamp(value, minimum, maximum):
+    return max(minimum, min(value, maximum))
+
+def wait_lock(seconds=0.4):
+    start = time.time()
+    found_frames = 0
+    last_detection = None
+    while time.time() - start < seconds:
+        detection = detect_cube(latest_frame)
+        if detection is not None:
+            found_frames += 1
+            last_detection = detection
+            if found_frames >= LOCK_FRAMES:
+                return last_detection
+        else:
+            found_frames = 0
+        time.sleep(0.05)
+    return None
+
+
+# ============================================================
+# ЛОГИКА ПОИСКА И ПРИБЛИЖЕНИЯ
+# ============================================================
+def search_segment(drone, heading, duration):
+    global system_status
+    system_status = f"Поиск (полоса {heading}°)"
+    
+    print(f"\n[SEARCH] курс: {heading}, время: {duration}")
+    drone.set_course(heading)
+    time.sleep(1.0)
+    drone.set_speed(SEARCH_SPEED)
+
+    start = time.time()
+    detected_count = 0
+
+    while time.time() - start < duration:
+        detection = detect_cube(latest_frame)
+        if detection is not None:
+            detected_count += 1
+            print(f"[VISION] x={round(detection['cx'], 1)} y={round(detection['cy'], 1)} area={round(detection['area'], 1)}")
+            if detected_count >= LOCK_FRAMES:
+                drone.set_speed(0)
+                system_status = "Цель обнаружена"
+                print("\n================================\n ЦЕЛЬ ОБНАРУЖЕНА\n================================")
+                return detection
+        else:
+            detected_count = 0
+        time.sleep(0.08)
+
+    drone.set_speed(0)
+    return None
+
+def shift_lane(drone):
+    global system_status
+    system_status = "Переход на полосу"
+    
+    print("[SEARCH] переход на соседнюю полосу")
+    drone.set_course(90)
+    time.sleep(1)
+    drone.set_speed(SEARCH_SPEED)
+    
+    start = time.time()
+    while time.time() - start < SHIFT_TIME:
+        detection = detect_cube(latest_frame)
+        if detection is not None:
+            drone.set_speed(0)
+            detection = wait_lock()
+            if detection is not None:
+                return detection
+        time.sleep(0.08)
+    drone.set_speed(0)
+    return None
+
+def reacquire(drone, base_course):
+    global system_status
+    system_status = "Повторный поиск"
+    
+    print("[VISION] цель потеряна, выполняю сканирование")
+    drone.set_speed(0)
+    for offset in [-10, -20, -30, -15, 0, 15, 30, 20, 10, 0]:
+        course = normalize_course(base_course + offset)
+        drone.set_course(course)
+        time.sleep(0.4)
+        detection = detect_cube(latest_frame)
+        if detection is not None:
+            detection = wait_lock(0.3)
+            if detection is not None:
+                print(f"[VISION] цель найдена снова: {course}")
+                return detection
+    print("[VISION] повторно найти цель не удалось")
+    return None
+
+def approach_cube(drone):
+    global system_status
+    system_status = "Приближение к кубику"
+    
+    print("\n================================\n ПРИБЛИЖЕНИЕ К КУБИКУ\n================================")
+    lost_since = None
+
+    while True:
+        detection = detect_cube(latest_frame)
+
+        if detection is None:
+            if lost_since is None:
+                lost_since = time.time()
+            drone.set_speed(0)
+            if time.time() - lost_since > 0.7:
+                result = reacquire(drone, drone.get_course())
+                if result is None:
+                    system_status = "Цель потеряна"
+                    return False
+                lost_since = None
+            time.sleep(0.05)
+            continue
+
+        lost_since = None
+        cx, cy = detection["cx"], detection["cy"]
+        w, h = detection["w"], detection["h"]
+        print(f"[TARGET] cx={round(cx)} cy={round(cy)} size={w}x{h}")
+
+        if max(w, h) >= STOP_BOX_SIZE:
+            drone.set_speed(0)
+            system_status = "КУБИК НАЙДЕН"
+            print("\n################################\n#       КУБИК НАЙДЕН           #\n################################")
+            
+            # Мигаем лазером при успехе
+            send_number(drone, 1) 
+            return True
+
+        error_x = (cx - IMG_CX) / IMG_CX
+        correction = clamp(error_x * YAW_KP, -MAX_YAW_CORRECTION, MAX_YAW_CORRECTION)
+        drone.set_course(normalize_course(drone.get_course() + correction))
+
+        size = max(w, h)
+        speed = 20 if size < 25 else (14 if size < 45 else 8)
+        if abs(error_x) > 0.45:
+            speed = 0
+
+        drone.set_speed(speed)
+        time.sleep(0.08)
+
+def search_pool(drone):
+    global system_status
+    system_status = "Начало поиска"
+    
+    print("\n================================\n ПОИСК КУБИКА\n================================")
+    drone.set_speed(0)
+    drone.set_depth(SEARCH_DEPTH)
+    drone.set_pitch(SEARCH_PITCH)
+    time.sleep(2)
+
+    for lane in range(LANES):
+        print(f"\n========== ПОЛОСА {lane + 1} ИЗ {LANES} ==========")
+        heading = 0 if lane % 2 == 0 else 180
+
+        detection = search_segment(drone, heading, LONG_TIME)
+        if detection is not None and approach_cube(drone):
+            return True
+
+        if lane == LANES - 1:
+            break
+
+        detection = shift_lane(drone)
+        if detection is not None and approach_cube(drone):
+            return True
+
+    drone.set_speed(0)
+    system_status = "Кубик не найден"
+    print("\nКубик не найден.")
+    return False
+
+
+# ============================================================
+# MAIN
+# ============================================================
+if __name__ == "__main__":
+    print("Запуск поиска кубика...")
+    print("📺 Обработанный видеопоток: http://localhost:5000/video")
+    print("   (или http://<IP_ДРОНА>:5000/video с другого устройства)")
+
+    drone = DroneLibrary()
+
+    web_thread = threading.Thread(target=start_web_server, daemon=True)
+    web_thread.start()
+
+    rospy.Subscriber("/raspicam_node/image", Image, camera_callback, queue_size=1)
+
+    drone.start()
+
+    try:
+        search_pool(drone)
+    except KeyboardInterrupt:
+        print("\nОстановка пользователем")
+    except Exception as exc:
+        print(f"ОШИБКА: {type(exc).__name__} {exc}")
+    finally:
+        print("\nОстановка дрона...")
+        drone.set_speed(0)
+        try:
+            drone.set_pitch(0)
+        except Exception:
+            pass
+        
+        time.sleep(0.5)
+        drone.stop()
+        drone.set_offline_mode()
+        
+        print("Программа завершена")
+        rospy.signal_shutdown("Mission complete")
+        time.sleep(1.0)
+        cv2.destroyAllWindows()
