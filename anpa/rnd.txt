@@ -450,3 +450,662 @@ if __name__ == "__main__":
         rospy.signal_shutdown("Mission complete")
         time.sleep(1.0)
         cv2.destroyAllWindows()
+        
+        
+        
+        #!/usr/bin/env python3
+
+import time
+import cv2
+import numpy as np
+import rospy
+import threading
+
+from sensor_msgs.msg import Image
+from cv_bridge import CvBridge
+from user.library import DroneLibrary
+from flask import Flask, Response
+
+
+# ============================================================
+# ВЕБ-СЕРВЕР ДЛЯ ВИДЕОПОТОКА (FLASK)
+# ============================================================
+app = Flask(__name__)
+frame_lock = threading.Lock()
+latest_frame_for_web = None
+system_status = "Инициализация"  # Статус для отображения на видео
+
+def process_frame_for_display(frame):
+    """
+    Обрабатывает кадр для отображения в браузере:
+    - Рисует рамку вокруг кубика
+    - Выводит координаты и размер
+    - Показывает статус системы
+    """
+    if frame is None:
+        return None
+    
+    # Копируем кадр, чтобы не портить оригинал
+    display_frame = frame.copy()
+    
+    # 1. Детекция кубика для отрисовки
+    detection = detect_cube(display_frame)
+    
+    if detection is not None:
+        x, y, w, h = detection["x"], detection["y"], detection["w"], detection["h"]
+        cx, cy = detection["cx"], detection["cy"]
+        area = detection["area"]
+        
+        # Рисуем зеленый прямоугольник вокруг кубика
+        cv2.rectangle(display_frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+        
+        # Рисуем точку в центре
+        cv2.circle(display_frame, (int(cx), int(cy)), 5, (0, 0, 255), -1)
+        
+        # Выводим информацию об объекте
+        info_text = f"Object: ({int(cx)}, {int(cy)}) {w}x{h} Area:{int(area)}"
+        cv2.putText(display_frame, info_text, (10, 30), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+    else:
+        cv2.putText(display_frame, "No object detected", (10, 30), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+    
+    # 2. Статус системы (в правом верхнем углу)
+    h, w = display_frame.shape[:2]
+    status_color = (0, 255, 0) if "РАСПОЗНАН" in system_status or system_status == "КУБИК НАЙДЕН" else (255, 255, 0)
+    cv2.putText(display_frame, f"Status: {system_status}", (w - 200, 30), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, status_color, 2)
+    
+    # 3. Разрешение кадра (в правом нижнем углу)
+    cv2.putText(display_frame, f"{w}x{h}", (w - 80, h - 10), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+    
+    return display_frame
+
+
+def generate_frames():
+    """Генератор кадров для MJPEG потока в браузер"""
+    global latest_frame_for_web
+    while True:
+        with frame_lock:
+            if latest_frame_for_web is not None:
+                frame_copy = latest_frame_for_web.copy()
+            else:
+                frame_copy = None
+        
+        if frame_copy is not None:
+            # Обрабатываем кадр (рисуем рамки, текст и т.д.)
+            processed_frame = process_frame_for_display(frame_copy)
+            
+            if processed_frame is not None:
+                # Сжимаем в JPEG (качество 70% для баланса скорость/четкость)
+                ret, buffer = cv2.imencode('.jpg', processed_frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                if ret:
+                    yield (b'--frame\r\n'
+                           b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+        time.sleep(0.05)  # ~20 FPS
+
+@app.route('/video')
+def video_feed():
+    return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+def start_web_server():
+    app.run(host='0.0.0.0', port=5000, threaded=True, use_reloader=False)
+
+
+# ============================================================
+# НАСТРОЙКИ ЦВЕТА И КАМЕРЫ
+# ============================================================
+LOWER_HSV = np.array([15, 80, 80])
+UPPER_HSV = np.array([40, 255, 255])
+
+IMG_W = 320
+IMG_H = 240
+IMG_CX = IMG_W // 2       # 160
+IMG_CY = IMG_H // 2       # 120
+
+
+# ============================================================
+# НАСТРОЙКИ ПОИСКА (ЗМЕЙКА)
+# ============================================================
+SEARCH_DEPTH = 0.35
+SEARCH_PITCH = -15
+SEARCH_SPEED = 25
+APPROACH_SPEED = 15
+
+LANES = 5                  # Количество полос для змейки
+LONG_TIME = 12.0           # Время поиска на одной полосе (сек)
+SHIFT_TIME = 2.0           # Время перехода на соседнюю полосу (сек)
+
+MIN_AREA = 40
+LOCK_FRAMES = 3
+
+# Параметры повторного поиска
+REACQUIRE_ENABLED = True
+REACQUIRE_TIMEOUT = 0.7    # Время ожидания перед повторным поиском (сек)
+REACQUIRE_SCAN_TIME = 0.5  # Время на проверку каждого угла (сек)
+
+
+# ============================================================
+# НАСТРОЙКИ P-РЕГУЛЯТОРА ЦЕНТРОВКИ
+# ============================================================
+# "Мертвая зона" в пикселях. Если отклонение меньше этого значения, 
+# дрон считает, что кубик уже по центру, и не делает поправок.
+CENTER_THRESHOLD_X = 15  # Допустимое отклонение по горизонтали (X)
+CENTER_THRESHOLD_Y = 15  # Допустимое отклонение по вертикали (Y)
+
+# Коэффициенты усиления P-регулятора
+YAW_KP = 15.0            # Коэффициент для рыскания (Yaw)
+PITCH_KP = 12.0          # Коэффициент для тангажа (Pitch)
+
+# Ограничения на величину поправки за один шаг (для плавности)
+MAX_YAW_CORRECTION = 15.0    # Макс. изменение курса за шаг (градусы)
+MAX_PITCH_CORRECTION = 10.0  # Макс. изменение тангажа за шаг (градусы)
+
+# Абсолютные пределы тангажа (чтобы дрон не задрал камеру вертикально вверх/вниз)
+MIN_PITCH = -30.0
+MAX_PITCH = 30.0
+
+
+# ============================================================
+# НАСТРОЙКИ КЛАССИФИКАЦИИ И ПРИБЛИЖЕНИЯ
+# ============================================================
+CENTER_CONFIRM_FRAMES = 5      # Сколько кадров подряд кубик должен быть в центре для завершения центровки
+CLASSIFY_CONFIRM_FRAMES = 5    # Сколько кадров подряд один класс для завершения приближения
+MIN_SIZE_FOR_CLASSIFY = 30     # Минимальный размер кубика (px) для начала классификации
+
+
+bridge = CvBridge()
+latest_frame = None
+latest_frame_time = 0.0
+
+# Глобальная переменная для хранения распознанного класса
+detected_class = None
+
+
+# ============================================================
+# ФУНКЦИИ ЛАЗЕРА
+# ============================================================
+def turn_on_laser(drone):
+    """Включает лазер и оставляет его включённым постоянно"""
+    drone.set_laser(1)
+    print("[LASER] Лазер включён")
+
+
+# ============================================================
+# КЛАССИФИКАТОР (ЗАГЛУШКА)
+# ============================================================
+def classify_frame(frame):
+    """
+    Заглушка классификатора.
+    В реальной системе здесь должна быть нейронная сеть.
+    Всегда возвращает класс 1.
+    
+    Args:
+        frame: кадр изображения (numpy array)
+    
+    Returns:
+        int: предсказанный класс объекта
+    """
+    # TODO: заменить на реальную нейронную сеть
+    # model = load_model(...)
+    # prediction = model.predict(preprocess(frame))
+    # return prediction
+    return 1
+
+
+# ============================================================
+# ROS CAMERA
+# ============================================================
+def camera_callback(msg):
+    global latest_frame, latest_frame_time, latest_frame_for_web
+    try:
+        frame = bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+        
+        latest_frame = frame
+        latest_frame_time = time.time()
+        
+        with frame_lock:
+            latest_frame_for_web = frame
+            
+    except Exception as exc:
+        print("Ошибка камеры:", exc)
+
+
+# ============================================================
+# HSV ДЕТЕКТОР
+# ============================================================
+def detect_cube(img):
+    if img is None:
+        return None
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, LOWER_HSV, UPPER_HSV)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    best, best_area = None, 0
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area < MIN_AREA:
+            continue
+        if area > best_area:
+            best_area = area
+            best = contour
+
+    if best is None:
+        return None
+
+    x, y, w, h = cv2.boundingRect(best)
+    return {"cx": x + w / 2, "cy": y + h / 2, "area": best_area, "x": x, "y": y, "w": w, "h": h}
+
+
+# ============================================================
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ============================================================
+def normalize_course(course):
+    while course >= 360: course -= 360
+    while course < 0: course += 360
+    return course
+
+def clamp(value, minimum, maximum):
+    return max(minimum, min(value, maximum))
+
+
+# ============================================================
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ПОИСКА
+# ============================================================
+def scan_for_cube(drone, duration, status_msg="Сканирование"):
+    """
+    Универсальная функция сканирования.
+    Проверяет наличие кубика в течение заданного времени.
+    Возвращает detection, если кубик найден, иначе None.
+    """
+    global system_status
+    system_status = status_msg
+    
+    start = time.time()
+    detected_count = 0
+    
+    while time.time() - start < duration:
+        if rospy.is_shutdown():
+            return None
+            
+        detection = detect_cube(latest_frame)
+        if detection is not None:
+            detected_count += 1
+            if detected_count >= LOCK_FRAMES:
+                return detection
+        else:
+            detected_count = 0
+        time.sleep(0.08)
+    
+    return None
+
+def smart_reacquire(drone, last_known_course):
+    """
+    Умный повторный поиск.
+    Сканирует окрестности последней известной позиции цели.
+    """
+    global system_status
+    system_status = "Повторный поиск"
+    
+    if not REACQUIRE_ENABLED:
+        return None
+    
+    print("[VISION] цель потеряна, выполняю интеллектуальное сканирование")
+    drone.set_speed(0)
+    
+    # Сканируем углы вокруг последней известной позиции
+    scan_offsets = [-30, -20, -10, 0, 10, 20, 30]
+    
+    for offset in scan_offsets:
+        if rospy.is_shutdown():
+            return None
+            
+        course = normalize_course(last_known_course + offset)
+        drone.change_course(course)
+        time.sleep(REACQUIRE_SCAN_TIME)
+        
+        detection = scan_for_cube(drone, 0.3, f"Сканирование {course}°")
+        if detection is not None:
+            print(f"[VISION] цель найдена снова на курсе {course}°")
+            return detection
+    
+    print("[VISION] повторно найти цель не удалось")
+    return None
+
+
+# ============================================================
+# ФАЗА 1: ЦЕНТРОВКА КУБИКА
+# ============================================================
+def center_cube(drone):
+    """
+    Фаза 1: Центровка кубика.
+    Дрон стоит на месте и центрирует кубик с помощью P-регулятора,
+    пока он не окажется устойчиво в центре кадра 
+    (CENTER_CONFIRM_FRAMES кадров подряд).
+    """
+    global system_status
+    system_status = "Центровка кубика"
+    
+    print("\n================================\n ЦЕНТРОВКА КУБИКА\n================================")
+    
+    lost_since = None
+    last_known_course = drone.get_course()
+    current_pitch = SEARCH_PITCH
+    center_confirm_count = 0
+    
+    while True:
+        if rospy.is_shutdown():
+            return False
+        
+        detection = detect_cube(latest_frame)
+        
+        if detection is None:
+            if lost_since is None:
+                lost_since = time.time()
+            drone.set_speed(0)
+            
+            if time.time() - lost_since > REACQUIRE_TIMEOUT:
+                result = smart_reacquire(drone, last_known_course)
+                if result is None:
+                    system_status = "Цель потеряна при центровке"
+                    return False
+                lost_since = None
+                center_confirm_count = 0
+            time.sleep(0.05)
+            continue
+        
+        lost_since = None
+        cx, cy = detection["cx"], detection["cy"]
+        
+        error_x = cx - IMG_CX
+        error_y = cy - IMG_CY
+        
+        last_known_course = drone.get_course()
+        
+        # P-регулятор для YAW
+        current_course = drone.get_course()
+        yaw_centered = True
+        if abs(error_x) > CENTER_THRESHOLD_X:
+            norm_error_x = error_x / IMG_CX
+            yaw_correction = clamp(norm_error_x * YAW_KP, -MAX_YAW_CORRECTION, MAX_YAW_CORRECTION)
+            target_course = normalize_course(current_course + yaw_correction)
+            drone.change_course(target_course)
+            yaw_centered = False
+        
+        # P-регулятор для PITCH
+        try:
+            current_pitch = drone.get_pitch()
+        except AttributeError:
+            pass
+        
+        pitch_centered = True
+        if abs(error_y) > CENTER_THRESHOLD_Y:
+            norm_error_y = -error_y / IMG_CY
+            pitch_correction = clamp(norm_error_y * PITCH_KP, -MAX_PITCH_CORRECTION, MAX_PITCH_CORRECTION)
+            target_pitch = clamp(current_pitch + pitch_correction, MIN_PITCH, MAX_PITCH)
+            drone.change_pitch(target_pitch)
+            current_pitch = target_pitch
+            pitch_centered = False
+        
+        drone.set_speed(0)  # Стоим на месте во время центровки
+        
+        # Считаем кадры, когда кубик устойчиво в центре
+        if yaw_centered and pitch_centered:
+            center_confirm_count += 1
+        else:
+            center_confirm_count = 0
+        
+        # Проверка: кубик устойчиво в центре
+        if center_confirm_count >= CENTER_CONFIRM_FRAMES:
+            print(f"[CENTER] Кубик отцентрован ({CENTER_CONFIRM_FRAMES} кадров подряд)")
+            return True
+        
+        time.sleep(0.08)
+
+
+# ============================================================
+# ФАЗА 2: ПРИБЛИЖЕНИЕ С КЛАССИФИКАЦИЕЙ
+# ============================================================
+def approach_with_classification(drone):
+    """
+    Фаза 2: Приближение к кубику с классификацией.
+    Дрон движется вперёд, продолжая центрировать кубик.
+    Приближение завершается, когда классификатор 
+    CLASSIFY_CONFIRM_FRAMES кадров подряд возвращает один и тот же класс.
+    
+    Returns:
+        int or None: распознанный класс, или None при потере цели
+    """
+    global system_status, detected_class
+    system_status = "Приближение с классификацией"
+    
+    print("\n================================\n ПРИБЛИЖЕНИЕ С КЛАССИФИКАЦИЕЙ\n================================")
+    
+    lost_since = None
+    last_known_course = drone.get_course()
+    current_pitch = SEARCH_PITCH
+    
+    last_class = None
+    consecutive_count = 0
+    final_class = None
+    
+    while True:
+        if rospy.is_shutdown():
+            return None
+        
+        detection = detect_cube(latest_frame)
+        
+        if detection is None:
+            if lost_since is None:
+                lost_since = time.time()
+            drone.set_speed(0)
+            
+            if time.time() - lost_since > REACQUIRE_TIMEOUT:
+                result = smart_reacquire(drone, last_known_course)
+                if result is None:
+                    system_status = "Цель потеряна при приближении"
+                    return None
+                lost_since = None
+                # Сбрасываем счётчик классификации после повторного поиска
+                last_class = None
+                consecutive_count = 0
+            time.sleep(0.05)
+            continue
+        
+        lost_since = None
+        cx, cy = detection["cx"], detection["cy"]
+        w, h = detection["w"], detection["h"]
+        size = max(w, h)
+        
+        last_known_course = drone.get_course()
+        
+        error_x = cx - IMG_CX
+        error_y = cy - IMG_CY
+        
+        print(f"[TARGET] cx={round(cx)} cy={round(cy)} size={w}x{h} | class_count={consecutive_count}/{CLASSIFY_CONFIRM_FRAMES}")
+        
+        # P-регулятор для YAW (продолжаем центрировать во время приближения)
+        current_course = drone.get_course()
+        if abs(error_x) > CENTER_THRESHOLD_X:
+            norm_error_x = error_x / IMG_CX
+            yaw_correction = clamp(norm_error_x * YAW_KP, -MAX_YAW_CORRECTION, MAX_YAW_CORRECTION)
+            target_course = normalize_course(current_course + yaw_correction)
+            drone.change_course(target_course)
+        
+        # P-регулятор для PITCH
+        try:
+            current_pitch = drone.get_pitch()
+        except AttributeError:
+            pass
+        
+        if abs(error_y) > CENTER_THRESHOLD_Y:
+            norm_error_y = -error_y / IMG_CY
+            pitch_correction = clamp(norm_error_y * PITCH_KP, -MAX_PITCH_CORRECTION, MAX_PITCH_CORRECTION)
+            target_pitch = clamp(current_pitch + pitch_correction, MIN_PITCH, MAX_PITCH)
+            drone.change_pitch(target_pitch)
+            current_pitch = target_pitch
+        
+        # Классификация, если размер кубика достаточен
+        if size >= MIN_SIZE_FOR_CLASSIFY:
+            predicted_class = classify_frame(latest_frame)
+            
+            if predicted_class == last_class:
+                consecutive_count += 1
+            else:
+                last_class = predicted_class
+                consecutive_count = 1
+            
+            # Проверка: n кадров подряд один класс
+            if consecutive_count >= CLASSIFY_CONFIRM_FRAMES:
+                final_class = predicted_class
+                drone.set_speed(0)
+                detected_class = final_class
+                system_status = f"Класс {final_class} распознан"
+                print(f"\n################################\n#  КЛАСС {final_class} РАСПОЗНАН  #\n################################")
+                # Включаем лазер и оставляем его включённым
+                turn_on_laser(drone)
+                return final_class
+        
+        # Управление скоростью
+        speed = APPROACH_SPEED
+        
+        # Если кубик сильно смещён, останавливаемся для центровки
+        if abs(error_x) > (CENTER_THRESHOLD_X * 2) or abs(error_y) > (CENTER_THRESHOLD_Y * 2):
+            speed = 0
+        
+        drone.set_speed(speed)
+        time.sleep(0.08)
+
+
+# ============================================================
+# ЛОГИКА ПОИСКА ЗМЕЙКОЙ
+# ============================================================
+def search_pool(drone):
+    """
+    Поиск кубика методом змейки.
+    После обнаружения кубика выполняет:
+    1. Центровку (удержание в центре)
+    2. Приближение с классификацией
+    """
+    global system_status
+    system_status = "Начало поиска"
+    
+    print("\n================================\n ПОИСК КУБИКА (ЗМЕЙКА)\n================================")
+    drone.set_speed(0)
+    drone.set_depth(SEARCH_DEPTH)
+    drone.change_pitch(SEARCH_PITCH)
+    time.sleep(2)
+    
+    for lane in range(LANES):
+        if rospy.is_shutdown():
+            return False
+            
+        print(f"\n========== ПОЛОСА {lane + 1} ИЗ {LANES} ==========")
+        
+        # Чередование направления: 0° и 180°
+        heading = 0 if lane % 2 == 0 else 180
+        
+        # Устанавливаем курс и начинаем движение
+        drone.change_course(heading)
+        time.sleep(1.0)
+        drone.set_speed(SEARCH_SPEED)
+        
+        # Сканируем текущую полосу
+        detection = scan_for_cube(drone, LONG_TIME, f"Поиск (полоса {heading}°)")
+        
+        if detection is not None:
+            drone.set_speed(0)
+            print("\n================================\n ЦЕЛЬ ОБНАРУЖЕНА\n================================")
+            
+            # ФАЗА 1: Центровка
+            if center_cube(drone):
+                # ФАЗА 2: Приближение с классификацией
+                final_class = approach_with_classification(drone)
+                if final_class is not None:
+                    print(f"\n[MISSION] Миссия завершена. Распознан класс: {final_class}")
+                    return True
+            
+            return False
+        
+        drone.set_speed(0)
+        
+        # Переход на следующую полосу (если не последняя)
+        if lane < LANES - 1:
+            print("[SEARCH] переход на соседнюю полосу")
+            drone.change_course(90)
+            time.sleep(1.0)
+            drone.set_speed(SEARCH_SPEED)
+            
+            # Во время перехода тоже ищем кубик
+            detection = scan_for_cube(drone, SHIFT_TIME, "Переход на полосу")
+            
+            if detection is not None:
+                drone.set_speed(0)
+                print("\n================================\n ЦЕЛЬ ОБНАРУЖЕНА ПРИ ПЕРЕХОДЕ\n================================")
+                
+                # ФАЗА 1: Центровка
+                if center_cube(drone):
+                    # ФАЗА 2: Приближение с классификацией
+                    final_class = approach_with_classification(drone)
+                    if final_class is not None:
+                        print(f"\n[MISSION] Миссия завершена. Распознан класс: {final_class}")
+                        return True
+                
+                return False
+            
+            drone.set_speed(0)
+    
+    drone.set_speed(0)
+    system_status = "Кубик не найден"
+    print("\nКубик не найден.")
+    return False
+
+
+# ============================================================
+# MAIN
+# ============================================================
+if __name__ == "__main__":
+    print("Запуск поиска кубика...")
+    print("📺 Обработанный видеопоток: http://localhost:5000/video")
+    print("   (или http://<IP_ДРОНА>:5000/video с другого устройства)")
+
+    drone = DroneLibrary()
+
+    web_thread = threading.Thread(target=start_web_server, daemon=True)
+    web_thread.start()
+
+    rospy.Subscriber("/raspicam_node/image", Image, camera_callback, queue_size=1)
+
+    drone.start()
+
+    try:
+        search_pool(drone)
+    except KeyboardInterrupt:
+        print("\nОстановка пользователем")
+    except Exception as exc:
+        print(f"ОШИБКА: {type(exc).__name__} {exc}")
+    finally:
+        print("\nОстановка дрона...")
+        drone.set_speed(0)
+        # Лазер НЕ выключаем - он должен гореть после успешного распознавания
+        try:
+            drone.change_pitch(0)
+        except Exception:
+            pass
+        
+        # Выводим результат классификации, если он есть
+        if detected_class is not None:
+            print(f"\n[РЕЗУЛЬТАТ] Распознанный класс: {detected_class}")
+            print("[РЕЗУЛЬТАТ] Лазер включён и будет гореть до выключения дрона")
+        else:
+            print("\n[РЕЗУЛЬТАТ] Класс не был распознан")
+        
+        time.sleep(0.5)
+        drone.stop()
+        drone.set_offline_mode()
+        
+        print("Программа завершена")
+        rospy.signal_shutdown("Mission complete")
+        time.sleep(1.0)
+        cv2.destroyAllWindows()
