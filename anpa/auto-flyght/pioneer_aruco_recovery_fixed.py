@@ -118,12 +118,8 @@ VIDEO_FPS = 20
 # ЦЕНТРИРОВАНИЕ ПО ARUCO
 # ============================================================
 
-# ArUco около самого края кадра игнорируется.
-# Все 4 угла маркера должны быть внутри безопасной области.
-ARUCO_EDGE_MARGIN_PX = 90
-
 # Допустимая погрешность центрирования, пикселей
-CENTER_TOLERANCE_PX = 70
+CENTER_TOLERANCE_PX = 85
 
 # P-регулятор: скорость = ошибка_в_пикселях * CENTER_KP
 CENTER_KP = 0.0010
@@ -137,10 +133,17 @@ CENTER_MAX_SPEED = 0.16
 CENTER_FILTER_ALPHA = 0.30
 
 # Время удержания маркера в центре
-CENTER_STABLE_TIME = 1.5
+CENTER_STABLE_TIME = 1
 
-# Допустимое время временной потери маркера
-MARKER_LOST_TIMEOUT = 2.0
+# Допустимое время временной потери маркера.
+# Пока таймаут не истёк, дрон продолжает осторожно двигаться
+# в направлении последней команды коррекции, чтобы снова увидеть ArUco.
+MARKER_LOST_TIMEOUT = 3.0
+
+# Скорость при временной потере ArUco уменьшаем относительно
+# последней команды центрирования.
+LOST_MARKER_SPEED_FACTOR = 0.55
+LOST_MARKER_MAX_SPEED = 0.08
 
 # Максимальное время центрирования
 CENTER_TIMEOUT = 40.0
@@ -347,51 +350,24 @@ def video_worker():
                     )
 
                     if marker_id == TARGET_MARKER_ID:
+                        current_target_visible = True
+                        current_target_center = (
+                            center_x,
+                            center_y
+                        )
 
-                        marker_inside_safe_area = True
-
-                        for px, py in points:
-                            if (
-                                px < ARUCO_EDGE_MARGIN_PX
-                                or px > frame_w - ARUCO_EDGE_MARGIN_PX
-                                or py < ARUCO_EDGE_MARGIN_PX
-                                or py > frame_h - ARUCO_EDGE_MARGIN_PX
-                            ):
-                                marker_inside_safe_area = False
-                                break
-
-                        if marker_inside_safe_area:
-                            current_target_visible = True
-                            current_target_center = (
-                                center_x,
-                                center_y
-                            )
-
-                            cv2.putText(
-                                frame,
-                                "TARGET",
-                                (
-                                    center_x + 10,
-                                    center_y - 10
-                                ),
-                                cv2.FONT_HERSHEY_SIMPLEX,
-                                0.7,
-                                (0, 0, 255),
-                                2
-                            )
-                        else:
-                            cv2.putText(
-                                frame,
-                                "TARGET AT EDGE - IGNORE",
-                                (
-                                    max(10, center_x - 120),
-                                    max(25, center_y - 20)
-                                ),
-                                cv2.FONT_HERSHEY_SIMPLEX,
-                                0.55,
-                                (0, 0, 255),
-                                2
-                            )
+                        cv2.putText(
+                            frame,
+                            "TARGET",
+                            (
+                                center_x + 10,
+                                center_y - 10
+                            ),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.7,
+                            (0, 0, 255),
+                            2
+                        )
 
             # ====================================================
             # ПОСАДОЧНАЯ ЗОНА: ОРАНЖЕВЫЙ КРУГ С БЕЛОЙ "Н"
@@ -515,17 +491,6 @@ def video_worker():
                 markerType=cv2.MARKER_CROSS,
                 markerSize=30,
                 thickness=2
-            )
-
-            cv2.rectangle(
-                frame,
-                (ARUCO_EDGE_MARGIN_PX, ARUCO_EDGE_MARGIN_PX),
-                (
-                    frame_w - ARUCO_EDGE_MARGIN_PX,
-                    frame_h - ARUCO_EDGE_MARGIN_PX
-                ),
-                (255, 255, 255),
-                1
             )
 
             with marker_lock:
@@ -652,7 +617,7 @@ def calculate_flight_time(x, y, z, speed=FLIGHT_SPEED):
 
     pos = pioneer.get_local_position_lps()
 
-    if not pos or len(pos) < 3:
+    if pos is None or len(pos) < 3:
         return MIN_FLIGHT_TIME
 
     dx = x - pos[0]
@@ -790,7 +755,7 @@ def stop_at_current_position():
     """
     pos = pioneer.get_local_position_lps()
 
-    if not pos or len(pos) < 3:
+    if pos is None or len(pos) < 3:
         return
 
     x, y, z = pos[:3]
@@ -818,10 +783,12 @@ class CenteringError(Exception):
 
 def center_over_target():
     """
-    Плавное центрирование над ArUco.
+    Плавное центрирование над ArUco с P-регулятором.
 
-    True  -> центрирование успешно.
-    False -> ArUco потерян или таймаут; маршрут должен продолжиться.
+    Если ArUco кратковременно пропадает из кадра, дрон не замирает
+    сразу, а продолжает медленно лететь в направлении последней
+    корректирующей команды. Это помогает повторно захватить метку,
+    если она ушла за край кадра.
     """
 
     print("[CENTER] Начинаю плавное центрирование")
@@ -835,8 +802,17 @@ def center_over_target():
     filtered_x = None
     filtered_y = None
 
+    # Последняя ненулевая команда движения к метке.
+    # При временной потере ArUco будем продолжать её с меньшей скоростью.
+    last_recovery_vx = 0.0
+    last_recovery_vy = 0.0
+    marker_was_visible = True
+
     def clamp(value, low, high):
         return max(low, min(high, value))
+
+    def clamp_abs(value, max_abs):
+        return clamp(value, -max_abs, max_abs)
 
     def speed_from_error(error_px):
         abs_error = abs(error_px)
@@ -857,9 +833,13 @@ def center_over_target():
         now = time.time()
 
         if now - started > CENTER_TIMEOUT:
-            print("[CENTER] Таймаут. Продолжаю маршрут.")
-            stop_at_current_position()
-            return False
+            pioneer.set_manual_speed_body_fixed(
+                vx=0.0, vy=0.0, vz=0.0, yaw_rate=0.0
+            )
+            raise CenteringError(
+                "Не удалось отцентрироваться над ArUco "
+                "за отведённое время"
+            )
 
         visible, center, frame_size = get_marker_data()
 
@@ -869,22 +849,53 @@ def center_over_target():
             or frame_size is None
         ):
             stable_since = None
+            lost_for = now - marker_last_seen
+
+            if lost_for > MARKER_LOST_TIMEOUT:
+                pioneer.set_manual_speed_body_fixed(
+                    vx=0.0, vy=0.0, vz=0.0, yaw_rate=0.0
+                )
+                raise CenteringError(
+                    f"ArUco потерян более {MARKER_LOST_TIMEOUT:.1f} с"
+                )
+
+            # Продолжаем двигаться туда, куда только что корректировались,
+            # но медленнее и с ограничением максимальной скорости.
+            recovery_vx = clamp_abs(
+                last_recovery_vx * LOST_MARKER_SPEED_FACTOR,
+                LOST_MARKER_MAX_SPEED
+            )
+            recovery_vy = clamp_abs(
+                last_recovery_vy * LOST_MARKER_SPEED_FACTOR,
+                LOST_MARKER_MAX_SPEED
+            )
+
+            if marker_was_visible:
+                print(
+                    f"[CENTER LOST] ArUco временно потерян. "
+                    f"Продолжаю в последнюю сторону: "
+                    f"vx={recovery_vx:+.3f}, vy={recovery_vy:+.3f}"
+                )
+            marker_was_visible = False
 
             pioneer.set_manual_speed_body_fixed(
-                vx=0.0,
-                vy=0.0,
+                vx=recovery_vx,
+                vy=recovery_vy,
                 vz=0.0,
                 yaw_rate=0.0
             )
 
-            if now - marker_last_seen > MARKER_LOST_TIMEOUT:
-                print("[CENTER] ArUco потерян. Продолжаю маршрут.")
-                stop_at_current_position()
-                return False
-
-            time.sleep(0.05)
+            time.sleep(0.06)
             continue
 
+        # Маркер снова появился. После потери лучше начать фильтрацию заново,
+        # чтобы старые координаты не тянули управление в неверную сторону.
+        if not marker_was_visible:
+            print("[CENTER] ArUco снова найден")
+            filtered_x = None
+            filtered_y = None
+
+        marker_was_visible = True
         marker_last_seen = now
 
         marker_x_px, marker_y_px = center
@@ -903,14 +914,18 @@ def center_over_target():
                 + (1.0 - CENTER_FILTER_ALPHA) * filtered_y
             )
 
-        error_x = filtered_x - frame_w / 2.0
-        error_y = filtered_y - frame_h / 2.0
+        image_x_px = frame_w / 2.0
+        image_y_px = frame_h / 2.0
+
+        error_x = filtered_x - image_x_px
+        error_y = filtered_y - image_y_px
 
         centered_x = abs(error_x) <= CENTER_TOLERANCE_PX
         centered_y = abs(error_y) <= CENTER_TOLERANCE_PX
 
         print(
-            f"[CENTER] dx={error_x:+.1f}px "
+            f"[CENTER] "
+            f"dx={error_x:+.1f}px "
             f"dy={error_y:+.1f}px"
         )
 
@@ -928,15 +943,31 @@ def center_over_target():
             if now - stable_since >= CENTER_STABLE_TIME:
                 print("[CENTER] Центрирование завершено")
                 stop_at_current_position()
-                return True
+                return
 
             time.sleep(0.05)
             continue
 
         stable_since = None
 
+        # По горизонтали кадра: маркер справа -> летим вправо.
         vx = speed_from_error(error_x)
+
+        # По вертикали кадра оставляем знак как в исходной версии:
+        # маркер ниже центра -> движение назад.
         vy = -speed_from_error(error_y)
+
+        # Запоминаем последнее направление только когда команда ненулевая.
+        # По нему будем осторожно продолжать движение при потере изображения.
+        if abs(vx) > 1e-6 or abs(vy) > 1e-6:
+            last_recovery_vx = vx
+            last_recovery_vy = vy
+
+        print(
+            f"[CENTER CMD] "
+            f"vx={vx:+.3f} "
+            f"vy={vy:+.3f}"
+        )
 
         pioneer.set_manual_speed_body_fixed(
             vx=vx,
@@ -1161,7 +1192,7 @@ def return_to_landing_point_and_land(number=LANDING_POINT_NUMBER):
     # Удерживаем текущую позицию перед посадкой.
     hover_pos = pioneer.get_local_position_lps()
 
-    if hover_pos and len(hover_pos) >= 3:
+    if hover_pos is not None and len(hover_pos) >= 3:
         pioneer.go_to_local_point(
             x=hover_pos[0],
             y=hover_pos[1],
@@ -1250,6 +1281,7 @@ try:
 
     print("[FLIGHT] Взлёт")
     pioneer.takeoff()
+    # не добавлять wait_point() после взлёта, т.к. он не нужен
 
     print("[FLIGHT] Взлёт завершён")
 
@@ -1297,41 +1329,9 @@ try:
 
     print("[SEARCH] Единственный проход змейкой")
 
-    target_centered = False
-
-    def search_segment(x, y, z, yaw):
-        """
-        Летим к точке.
-        Если ArUco найден, пробуем центрирование.
-        Если ArUco потерян, продолжаем лететь к той же точке.
-        """
-
-        while True:
-            found = fly_and_search(
-                x,
-                y,
-                z,
-                yaw
-            )
-
-            if not found:
-                return False
-
-            print(
-                "[SEARCH] ArUco найден в безопасной части кадра. "
-                "Пробую центрирование."
-            )
-
-            if center_over_target():
-                return True
-
-            print(
-                "[SEARCH] ArUco потерян. "
-                "Продолжаю текущий участок маршрута."
-            )
-
     for column_index, x in enumerate(x_columns):
 
+        # Чередуем направление по Y
         if column_index % 2 == 0:
             y_start = Y_MIN
             y_end = Y_MAX
@@ -1339,56 +1339,86 @@ try:
             y_start = Y_MAX
             y_end = Y_MIN
 
-        target_centered = search_segment(
+        # Переход на начало полосы
+        target_found = fly_and_search(
             x,
             y_start,
             SEARCH_HEIGHT,
             YAW
         )
 
-        if target_centered:
+        if target_found:
             break
 
-        target_centered = search_segment(
+        # Непрерывный пролёт вдоль всей полосы
+        target_found = fly_and_search(
             x,
             y_end,
             SEARCH_HEIGHT,
             YAW
         )
 
-        if target_centered:
+        if target_found:
             break
 
-    if not target_centered:
+    # --------------------------------------------------------
+    # 4. Если маркер НЕ найден — сразу домой и посадка
+    # --------------------------------------------------------
+
+    if not target_found:
         print(
             f"[SEARCH] ArUco ID {TARGET_MARKER_ID} "
-            "не был успешно отцентрирован за один проход."
+            "не найден за один проход."
         )
-        print("[SEARCH] Возврат домой.")
-        return_home_and_land()
+        print("[SEARCH] Поиск завершён. Возврат домой.")
+        return_to_landing_point_and_land(LANDING_POINT_NUMBER)
 
     else:
-        print(
-            f"[HOVER] Зависание над меткой "
-            f"{HOVER_TIME:.1f} секунд"
-        )
+        # ----------------------------------------------------
+        # 5. Маркер найден — центрирование
+        # ----------------------------------------------------
 
-        hover_pos = pioneer.get_local_position_lps()
+        print("[SEARCH] Маршрут поиска остановлен")
 
-        if hover_pos:
-            pioneer.go_to_local_point(
-                x=hover_pos[0],
-                y=hover_pos[1],
-                z=SEARCH_HEIGHT,
-                yaw=YAW,
-                time=MIN_FLIGHT_TIME
+        try:
+            center_over_target()
+
+        except CenteringError as e:
+            print()
+            print("[CENTER ERROR]", e)
+            print("[SAFETY] Центрирование не удалось. Возврат на старт.")
+            return_to_landing_point_and_land(LANDING_POINT_NUMBER)
+
+        else:
+            # ------------------------------------------------
+            # 6. Зависание
+            # ------------------------------------------------
+
+            print(
+                f"[HOVER] Зависание над меткой "
+                f"{HOVER_TIME:.1f} секунд"
             )
 
-        time.sleep(HOVER_TIME)
+            hover_pos = pioneer.get_local_position_lps()
 
-        return_to_landing_point_and_land(
-            LANDING_POINT_NUMBER
-        )
+            if hover_pos is not None and len(hover_pos) >= 3:
+                pioneer.go_to_local_point(
+                    x=hover_pos[0],
+                    y=hover_pos[1],
+                    z=SEARCH_HEIGHT,
+                    yaw=YAW,
+                    time=MIN_FLIGHT_TIME
+                )
+
+            time.sleep(HOVER_TIME)
+
+            # --------------------------------------------
+            # 7. К выбранной посадочной точке
+            # --------------------------------------------
+
+            return_to_landing_point_and_land(
+                LANDING_POINT_NUMBER
+            )
 
 
 except KeyboardInterrupt:

@@ -1,13 +1,16 @@
 import time
 import math
 import threading
+from collections import deque
+
 import cv2
+import numpy as np
 
 from pioneer_sdk2 import Pioneer
 from pioneer_sdk2 import Camera
 from pioneer_sdk2 import ImageViewer
 from pioneer_sdk2 import ServoCamera
-
+пп
 
 # ============================================================
 # НАСТРОЙКИ
@@ -63,6 +66,49 @@ LANDING_APPROACH_HEIGHT = RETURN_HEIGHT
 LANDING_YAW = 0.0
 
 # ============================================================
+# ПРИЁМ ЛАЗЕРНОГО ПАКЕТА ПО КАМЕРЕ
+# Формат НЕ меняем: 1010 + 4 бита числа + CRC4.
+# CRC принимается, но намеренно НЕ проверяется.
+# Алгоритм детекции и декодирования взят из присланного приёмника:
+# красная точка ищется в центре ArUco 5, длина импульса измеряется
+# по количеству кадров.
+# ============================================================
+LASER_RX_PREAMBLE = (1, 0, 1, 0)
+LASER_RX_PREAMBLE_LEN = 4
+LASER_RX_MESSAGE_LEN = 4
+LASER_RX_CRC_LEN = 4
+
+LASER_RX_DOT_DURATION = 0.3
+LASER_RX_DASH_DURATION = 0.9
+
+LASER_RX_VIDEO_FPS = 20
+EXPECTED_DOT_FRAMES = max(1, round(LASER_RX_DOT_DURATION * LASER_RX_VIDEO_FPS))
+EXPECTED_DASH_FRAMES = max(1, round(LASER_RX_DASH_DURATION * LASER_RX_VIDEO_FPS))
+LASER_RX_FRAME_SPLIT = (
+    EXPECTED_DOT_FRAMES + EXPECTED_DASH_FRAMES
+) / 2.0
+
+LASER_RX_MIN_PULSE_FRAMES = max(
+    2,
+    round(EXPECTED_DOT_FRAMES * 0.45)
+)
+LASER_RX_MAX_PULSE_FRAMES = round(
+    EXPECTED_DASH_FRAMES * 1.8
+)
+LASER_RX_STATE_CONFIRM_FRAMES = 2
+
+# Область поиска лазера около центра ArUco.
+LASER_ROI_SCALE = 0.34
+LASER_MARKER_MEMORY_FRAMES = 10
+
+# Порог красной точки.
+LASER_MIN_RED = 150
+LASER_RED_DOMINANCE = 55
+LASER_MIN_RED_PIXELS = 3
+LASER_MIN_SATURATION = 120
+LASER_MIN_VALUE = 140
+
+# ============================================================
 # ВИЗУАЛЬНАЯ ЦЕНТРОВКА НАД ПОСАДОЧНОЙ ЗОНОЙ
 # ============================================================
 #
@@ -78,7 +124,7 @@ LANDING_MIN_CONTOUR_AREA = 800
 
 # Погрешность центровки больше, чем для ArUco:
 # идеально попадать в центр посадочного круга не требуется.
-LANDING_CENTER_TOLERANCE_PX = 100
+LANDING_CENTER_TOLERANCE_PX = 120
 
 # P-регулятор посадочной центровки.
 LANDING_CENTER_KP = 0.0008
@@ -115,11 +161,26 @@ CAMERA_ANGLE = -80
 VIDEO_FPS = 20
 
 # ============================================================
+# УСТОЙЧИВОЕ РАСПОЗНАВАНИЕ ARUCO ЧЕРЕЗ СЕТКУ
+# ============================================================
+
+# Сколько секунд хранить последнее корректное положение метки,
+# если сетка временно помешала распознаванию.
+ARUCO_DETECTION_MEMORY = 0.45
+
+# Масштаб дополнительного прохода распознавания.
+ARUCO_UPSCALE = 1.6
+
+# Подавление длинных линий сетки используется только как один
+# из вариантов изображения. Исходный кадр всегда проверяется первым.
+ARUCO_ENABLE_NET_SUPPRESSION = True
+
+# ============================================================
 # ЦЕНТРИРОВАНИЕ ПО ARUCO
 # ============================================================
 
 # Допустимая погрешность центрирования, пикселей
-CENTER_TOLERANCE_PX = 70
+CENTER_TOLERANCE_PX = 100
 
 # P-регулятор: скорость = ошибка_в_пикселях * CENTER_KP
 CENTER_KP = 0.0010
@@ -133,10 +194,17 @@ CENTER_MAX_SPEED = 0.16
 CENTER_FILTER_ALPHA = 0.30
 
 # Время удержания маркера в центре
-CENTER_STABLE_TIME = 1.5
+CENTER_STABLE_TIME = 1
 
-# Допустимое время временной потери маркера
-MARKER_LOST_TIMEOUT = 2.0
+# Допустимое время временной потери маркера.
+# Пока таймаут не истёк, дрон продолжает осторожно двигаться
+# в направлении последней команды коррекции, чтобы снова увидеть ArUco.
+MARKER_LOST_TIMEOUT = 3.0
+
+# Скорость при временной потере ArUco уменьшаем относительно
+# последней команды центрирования.
+LOST_MARKER_SPEED_FACTOR = 0.55
+LOST_MARKER_MAX_SPEED = 0.08
 
 # Максимальное время центрирования
 CENTER_TIMEOUT = 40.0
@@ -154,6 +222,12 @@ target_marker_visible = False
 target_marker_center = None
 target_frame_size = None
 
+# Память последнего достоверного распознавания ArUco.
+last_target_detection_time = -10_000.0
+last_target_center = None
+last_target_corners = None
+last_target_detection_mode = "NONE"
+
 # Состояние визуального детектора посадочной зоны.
 landing_zone_visible = False
 landing_zone_center = None
@@ -161,9 +235,343 @@ landing_zone_center = None
 camera = None
 viewer = None
 
+laser_rx_lock = threading.Lock()
+laser_rx_digit = None
+laser_rx_running = False
+
+laser_last_marker_roi = None
+laser_last_marker_seen_frame = -10_000
+laser_frame_number = 0
+
 
 # ============================================================
-# ARUCO
+# ЛАЗЕРНЫЙ ПРИЁМНИК ПО КАМЕРЕ
+# ============================================================
+
+def bits_to_int(bits):
+    value = 0
+    for bit in bits:
+        value = (value << 1) | int(bit)
+    return value
+
+
+def get_received_laser_digit():
+    with laser_rx_lock:
+        return laser_rx_digit
+
+
+def clear_received_laser_digit():
+    global laser_rx_digit
+    with laser_rx_lock:
+        laser_rx_digit = None
+
+
+class FrameLaserDecoder:
+    """
+    Декодирует лазерные импульсы по числу кадров.
+
+    Формат пакета сохраняется:
+        1010 + 4 бита числа + 4 бита CRC.
+
+    CRC-биты считываются, но результат CRC намеренно не проверяется.
+    Как только после преамбулы получены 4 бита сообщения со значением
+    0..8, число сразу публикуется и центрирование прекращается.
+    """
+
+    def __init__(self):
+        self.bit_history = deque(maxlen=100)
+        self.reset_all()
+
+    def reset_all(self):
+        self.raw_state = False
+        self.stable_state = False
+        self.same_raw_frames = 0
+        self.on_frames = 0
+        self.on_start_time = None
+
+        self.synced = False
+        self.payload_bits = []
+
+        self.last_bit = None
+        self.last_pulse_frames = 0
+        self.last_pulse_seconds = 0.0
+        self.status = "WAIT ARUCO 5"
+
+        self.bit_history.clear()
+
+    def reset_sync(self):
+        self.synced = False
+        self.payload_bits = []
+
+    def _find_preamble(self):
+        if len(self.bit_history) < LASER_RX_PREAMBLE_LEN:
+            return False
+
+        tail = list(self.bit_history)[-LASER_RX_PREAMBLE_LEN:]
+
+        if tuple(tail) == LASER_RX_PREAMBLE:
+            self.synced = True
+            self.payload_bits = []
+            self.status = "PREAMBLE OK"
+            print("[LASER RX] Преамбула 1010 найдена")
+            return True
+
+        return False
+
+    def _accept_message_early(self):
+        """
+        Принимаем число сразу после первых 4 бит сообщения.
+        CRC для принятия решения не нужен.
+        """
+        global laser_rx_digit, laser_rx_running
+
+        if len(self.payload_bits) < LASER_RX_MESSAGE_LEN:
+            return False
+
+        message_bits = self.payload_bits[:LASER_RX_MESSAGE_LEN]
+        value = bits_to_int(message_bits)
+
+        if 0 <= value <= 8:
+            with laser_rx_lock:
+                if laser_rx_digit is None:
+                    laser_rx_digit = value
+
+            self.status = f"RECEIVED {value}"
+            laser_rx_running = False
+
+            print(
+                f"[LASER RX] Получено число {value}; "
+                "CRC не проверяется"
+            )
+            return True
+
+        print(
+            f"[LASER RX] Число {value} вне диапазона 0..8, "
+            "ожидаю новый пакет"
+        )
+        self.reset_sync()
+        return False
+
+    def add_bit(self, bit, pulse_frames, pulse_seconds):
+        self.last_bit = bit
+        self.last_pulse_frames = pulse_frames
+        self.last_pulse_seconds = pulse_seconds
+        self.bit_history.append(bit)
+
+        print(
+            f"[LASER RX] BIT={bit} "
+            f"frames={pulse_frames} "
+            f"time={pulse_seconds:.3f}s"
+        )
+
+        if not self.synced:
+            self.status = "SEARCH PREAMBLE"
+            self._find_preamble()
+            return
+
+        self.payload_bits.append(bit)
+        self.status = (
+            f"DATA {len(self.payload_bits)}/"
+            f"{LASER_RX_MESSAGE_LEN + LASER_RX_CRC_LEN}"
+        )
+
+        # Число принимается сразу после 4 бит сообщения.
+        if len(self.payload_bits) == LASER_RX_MESSAGE_LEN:
+            self._accept_message_early()
+
+        # Если значение было недопустимым, оставшиеся CRC-биты
+        # не имеют значения — снова ищем преамбулу.
+
+    def finish_pulse(self):
+        frames = self.on_frames
+        seconds = 0.0
+
+        if self.on_start_time is not None:
+            seconds = time.monotonic() - self.on_start_time
+
+        self.on_frames = 0
+        self.on_start_time = None
+
+        if frames < LASER_RX_MIN_PULSE_FRAMES:
+            return
+
+        if frames > LASER_RX_MAX_PULSE_FRAMES:
+            self.status = "BAD LONG PULSE"
+            self.reset_sync()
+            print(
+                f"[LASER RX] Слишком длинный импульс: "
+                f"{frames} кадров, {seconds:.3f} с"
+            )
+            return
+
+        bit = 1 if frames >= LASER_RX_FRAME_SPLIT else 0
+        self.add_bit(bit, frames, seconds)
+
+    def update(self, laser_visible):
+        if not laser_rx_running:
+            return
+
+        if self.stable_state:
+            self.on_frames += 1
+
+        if laser_visible == self.raw_state:
+            self.same_raw_frames += 1
+        else:
+            self.raw_state = laser_visible
+            self.same_raw_frames = 1
+
+        if (
+            self.raw_state != self.stable_state
+            and self.same_raw_frames >= LASER_RX_STATE_CONFIRM_FRAMES
+        ):
+            if self.raw_state:
+                self.stable_state = True
+                self.on_frames = LASER_RX_STATE_CONFIRM_FRAMES
+                self.on_start_time = time.monotonic()
+                self.status = "LASER ON"
+            else:
+                self.stable_state = False
+                self.finish_pulse()
+
+
+laser_decoder = FrameLaserDecoder()
+
+
+def find_laser_roi(marker_corners, frame_shape, frame_number):
+    """
+    Возвращает небольшую область вокруг центра ArUco 5.
+    При кратком исчезновении метки использует последнюю ROI.
+    """
+    global laser_last_marker_roi, laser_last_marker_seen_frame
+
+    found_roi = None
+
+    if marker_corners is not None:
+        pts = marker_corners.reshape(4, 2).astype(np.float32)
+
+        center_x = float(np.mean(pts[:, 0]))
+        center_y = float(np.mean(pts[:, 1]))
+
+        side_lengths = [
+            np.linalg.norm(pts[(index + 1) % 4] - pts[index])
+            for index in range(4)
+        ]
+        marker_size = float(np.mean(side_lengths))
+
+        roi_size = max(8, int(marker_size * LASER_ROI_SCALE))
+        half = roi_size // 2
+
+        frame_h, frame_w = frame_shape[:2]
+
+        x1 = max(0, int(center_x) - half)
+        y1 = max(0, int(center_y) - half)
+        x2 = min(frame_w, int(center_x) + half + 1)
+        y2 = min(frame_h, int(center_y) + half + 1)
+
+        if x2 > x1 and y2 > y1:
+            found_roi = (x1, y1, x2, y2)
+            laser_last_marker_roi = found_roi
+            laser_last_marker_seen_frame = frame_number
+
+    if (
+        found_roi is None
+        and laser_last_marker_roi is not None
+        and frame_number - laser_last_marker_seen_frame
+        <= LASER_MARKER_MEMORY_FRAMES
+    ):
+        found_roi = laser_last_marker_roi
+
+    return found_roi
+
+
+def detect_red_laser(frame, roi_coords):
+    """Ищет красную лазерную точку внутри ROI центра ArUco."""
+    if roi_coords is None:
+        return False, 0, 0
+
+    x1, y1, x2, y2 = roi_coords
+    roi = frame[y1:y2, x1:x2]
+
+    if roi.size == 0:
+        return False, 0, 0
+
+    blue, green, red = cv2.split(roi)
+
+    red_mask_bgr = (
+        (red >= LASER_MIN_RED)
+        & (
+            red.astype(np.int16) - green.astype(np.int16)
+            >= LASER_RED_DOMINANCE
+        )
+        & (
+            red.astype(np.int16) - blue.astype(np.int16)
+            >= LASER_RED_DOMINANCE
+        )
+    )
+
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+
+    mask_low = cv2.inRange(
+        hsv,
+        np.array(
+            [0, LASER_MIN_SATURATION, LASER_MIN_VALUE],
+            dtype=np.uint8
+        ),
+        np.array([12, 255, 255], dtype=np.uint8)
+    )
+
+    mask_high = cv2.inRange(
+        hsv,
+        np.array(
+            [168, LASER_MIN_SATURATION, LASER_MIN_VALUE],
+            dtype=np.uint8
+        ),
+        np.array([179, 255, 255], dtype=np.uint8)
+    )
+
+    red_mask_hsv = (mask_low > 0) | (mask_high > 0)
+    combined = red_mask_bgr & red_mask_hsv
+
+    red_pixels = int(np.count_nonzero(combined))
+    peak_red = int(np.max(red)) if red.size else 0
+
+    return (
+        red_pixels >= LASER_MIN_RED_PIXELS,
+        red_pixels,
+        peak_red
+    )
+
+
+def start_laser_receiver():
+    global laser_rx_running
+
+    clear_received_laser_digit()
+    laser_decoder.reset_all()
+    laser_rx_running = True
+
+    print(
+        "[LASER RX] Камерный приём запущен: "
+        "красная точка в центре ArUco 5"
+    )
+
+
+def stop_laser_receiver():
+    global laser_rx_running
+    laser_rx_running = False
+    print("[LASER RX] Камерный приём остановлен")
+
+
+def landing_number_from_signal(value):
+    """0 означает посадочную зону 9; 1..8 остаются без изменения."""
+    if value == 0:
+        return 9
+    if 1 <= value <= 8:
+        return value
+    return 1
+
+
+# ============================================================
+# ARUCO: УСТОЙЧИВОЕ РАСПОЗНАВАНИЕ ЧЕРЕЗ СЕТКУ
 # ============================================================
 
 aruco_dictionary = cv2.aruco.getPredefinedDictionary(
@@ -172,10 +580,241 @@ aruco_dictionary = cv2.aruco.getPredefinedDictionary(
 
 aruco_parameters = cv2.aruco.DetectorParameters()
 
+# Более широкий набор окон адаптивной бинаризации.
+aruco_parameters.adaptiveThreshWinSizeMin = 3
+aruco_parameters.adaptiveThreshWinSizeMax = 61
+aruco_parameters.adaptiveThreshWinSizeStep = 4
+aruco_parameters.adaptiveThreshConstant = 7
+
+# Не отбрасываем метку из-за повреждённого сеткой контура.
+aruco_parameters.minMarkerPerimeterRate = 0.012
+aruco_parameters.maxMarkerPerimeterRate = 4.0
+aruco_parameters.polygonalApproxAccuracyRate = 0.07
+aruco_parameters.minCornerDistanceRate = 0.025
+aruco_parameters.minDistanceToBorder = 2
+
+# Уточнение найденных углов.
+aruco_parameters.cornerRefinementMethod = (
+    cv2.aruco.CORNER_REFINE_SUBPIX
+)
+aruco_parameters.cornerRefinementWinSize = 7
+aruco_parameters.cornerRefinementMaxIterations = 50
+aruco_parameters.cornerRefinementMinAccuracy = 0.01
+
+# Более подробное перспективное изображение клеток.
+aruco_parameters.perspectiveRemovePixelPerCell = 10
+aruco_parameters.perspectiveRemoveIgnoredMarginPerCell = 0.15
+
+# Разрешаем некоторое повреждение границы и клеток сеткой.
+aruco_parameters.maxErroneousBitsInBorderRate = 0.50
+aruco_parameters.errorCorrectionRate = 0.85
+aruco_parameters.detectInvertedMarker = True
+
 aruco_detector = cv2.aruco.ArucoDetector(
     aruco_dictionary,
     aruco_parameters
 )
+
+
+def suppress_net_lines(gray):
+    """
+    Строит вариант серого изображения с ослабленными длинными
+    горизонтальными и вертикальными линиями сетки.
+
+    Важно: результат используется только как дополнительный проход.
+    Обычное изображение проверяется детектором раньше.
+    """
+    clahe = cv2.createCLAHE(
+        clipLimit=2.0,
+        tileGridSize=(8, 8)
+    )
+    enhanced = clahe.apply(gray)
+
+    binary = cv2.adaptiveThreshold(
+        enhanced,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        31,
+        7
+    )
+
+    frame_h, frame_w = gray.shape[:2]
+
+    horizontal_length = max(17, frame_w // 32)
+    vertical_length = max(17, frame_h // 24)
+
+    horizontal_kernel = cv2.getStructuringElement(
+        cv2.MORPH_RECT,
+        (horizontal_length, 1)
+    )
+    vertical_kernel = cv2.getStructuringElement(
+        cv2.MORPH_RECT,
+        (1, vertical_length)
+    )
+
+    horizontal_lines = cv2.morphologyEx(
+        binary,
+        cv2.MORPH_OPEN,
+        horizontal_kernel
+    )
+    vertical_lines = cv2.morphologyEx(
+        binary,
+        cv2.MORPH_OPEN,
+        vertical_kernel
+    )
+
+    net_mask = cv2.bitwise_or(
+        horizontal_lines,
+        vertical_lines
+    )
+
+    net_mask = cv2.dilate(
+        net_mask,
+        np.ones((3, 3), dtype=np.uint8),
+        iterations=1
+    )
+
+    restored = cv2.inpaint(
+        enhanced,
+        net_mask,
+        3,
+        cv2.INPAINT_TELEA
+    )
+
+    return restored, net_mask
+
+
+def _target_result_from_detection(corners, ids, scale):
+    """
+    Из результата detectMarkers() выбирает только TARGET_MARKER_ID
+    и переводит координаты обратно в размер исходного кадра.
+    """
+    if ids is None or len(ids) == 0:
+        return None
+
+    flat_ids = ids.flatten().astype(int)
+    indexes = np.where(flat_ids == TARGET_MARKER_ID)[0]
+
+    if len(indexes) == 0:
+        return None
+
+    target_index = int(indexes[0])
+    target_corners = corners[target_index].astype(np.float32)
+
+    if scale != 1.0:
+        target_corners = target_corners / scale
+
+    return (
+        [target_corners],
+        np.array([[TARGET_MARKER_ID]], dtype=np.int32)
+    )
+
+
+def detect_target_aruco_robust(frame):
+    """
+    Ищет целевую ArUco по нескольким вариантам изображения.
+
+    Порядок:
+      1. обычный серый кадр;
+      2. CLAHE;
+      3. лёгкое размытие CLAHE;
+      4. увеличенный CLAHE;
+      5. подавление линий сетки;
+      6. увеличенный вариант после подавления сетки.
+
+    Возвращает:
+        corners, ids, detection_mode, net_mask
+    """
+    gray = cv2.cvtColor(
+        frame,
+        cv2.COLOR_BGR2GRAY
+    )
+
+    clahe = cv2.createCLAHE(
+        clipLimit=2.0,
+        tileGridSize=(8, 8)
+    )
+    enhanced = clahe.apply(gray)
+
+    variants = [
+        ("GRAY", gray, 1.0),
+        ("CLAHE", enhanced, 1.0),
+        (
+            "CLAHE_BLUR",
+            cv2.GaussianBlur(enhanced, (3, 3), 0),
+            1.0
+        ),
+    ]
+
+    upscale = float(ARUCO_UPSCALE)
+
+    if upscale > 1.0:
+        variants.append(
+            (
+                "CLAHE_SCALE",
+                cv2.resize(
+                    enhanced,
+                    None,
+                    fx=upscale,
+                    fy=upscale,
+                    interpolation=cv2.INTER_CUBIC
+                ),
+                upscale
+            )
+        )
+
+    net_mask = None
+
+    if ARUCO_ENABLE_NET_SUPPRESSION:
+        restored, net_mask = suppress_net_lines(gray)
+
+        variants.append(
+            ("NET_SUPPRESSED", restored, 1.0)
+        )
+
+        variants.append(
+            (
+                "NET_BLUR",
+                cv2.GaussianBlur(restored, (3, 3), 0),
+                1.0
+            )
+        )
+
+        if upscale > 1.0:
+            variants.append(
+                (
+                    "NET_SCALE",
+                    cv2.resize(
+                        restored,
+                        None,
+                        fx=upscale,
+                        fy=upscale,
+                        interpolation=cv2.INTER_CUBIC
+                    ),
+                    upscale
+                )
+            )
+
+    for mode, image, scale in variants:
+        corners, ids, _ = aruco_detector.detectMarkers(image)
+
+        target_result = _target_result_from_detection(
+            corners,
+            ids,
+            scale
+        )
+
+        if target_result is not None:
+            target_corners, target_ids = target_result
+            return (
+                target_corners,
+                target_ids,
+                mode,
+                net_mask
+            )
+
+    return [], None, "NONE", net_mask
 
 
 # ============================================================
@@ -215,8 +854,13 @@ def video_worker():
     global target_marker_visible
     global target_marker_center
     global target_frame_size
+    global last_target_detection_time
+    global last_target_center
+    global last_target_corners
+    global last_target_detection_mode
     global landing_zone_visible
     global landing_zone_center
+    global laser_frame_number
 
     try:
         print("[VIDEO] Подключение камеры...")
@@ -241,15 +885,14 @@ def video_worker():
 
             frame_h, frame_w = frame.shape[:2]
 
-            gray = cv2.cvtColor(
-                frame,
-                cv2.COLOR_BGR2GRAY
+            corners, ids, detection_mode, net_mask = (
+                detect_target_aruco_robust(frame)
             )
-
-            corners, ids, rejected = aruco_detector.detectMarkers(gray)
 
             current_target_visible = False
             current_target_center = None
+            current_target_corners = None
+            target_from_memory = False
 
             if ids is not None:
 
@@ -348,6 +991,14 @@ def video_worker():
                             center_x,
                             center_y
                         )
+                        current_target_corners = marker_corners
+
+                        last_target_detection_time = time.monotonic()
+                        last_target_center = current_target_center
+                        last_target_corners = (
+                            marker_corners.copy()
+                        )
+                        last_target_detection_mode = detection_mode
 
                         cv2.putText(
                             frame,
@@ -361,6 +1012,85 @@ def video_worker():
                             (0, 0, 255),
                             2
                         )
+
+            # При кратком пропуске распознавания используем последнее
+            # достоверное положение. Это не создаёт новую метку, а лишь
+            # переживает несколько кадров, закрытых линией сетки.
+            if not current_target_visible:
+                detection_age = (
+                    time.monotonic()
+                    - last_target_detection_time
+                )
+
+                if (
+                    last_target_center is not None
+                    and last_target_corners is not None
+                    and detection_age <= ARUCO_DETECTION_MEMORY
+                ):
+                    current_target_visible = True
+                    current_target_center = last_target_center
+                    current_target_corners = (
+                        last_target_corners.copy()
+                    )
+                    detection_mode = (
+                        f"MEM:{last_target_detection_mode}"
+                    )
+                    target_from_memory = True
+
+            # ====================================================
+            # ЛАЗЕРНЫЙ ПРИЁМ ПО КАДРАМ В ЦЕНТРЕ ARUCO 5
+            # ====================================================
+            laser_frame_number += 1
+
+            laser_roi = find_laser_roi(
+                current_target_corners,
+                frame.shape,
+                laser_frame_number
+            )
+
+            laser_visible, red_pixels, peak_red = detect_red_laser(
+                frame,
+                laser_roi
+            )
+
+            if laser_rx_running:
+                if laser_roi is not None:
+                    laser_decoder.update(laser_visible)
+                else:
+                    laser_decoder.status = "WAIT ARUCO 5"
+
+            if laser_roi is not None:
+                rx1, ry1, rx2, ry2 = laser_roi
+                cv2.rectangle(
+                    frame,
+                    (rx1, ry1),
+                    (rx2, ry2),
+                    (255, 255, 255),
+                    2
+                )
+
+                cv2.putText(
+                    frame,
+                    (
+                        f"LASER {'ON' if laser_visible else 'OFF'} "
+                        f"RPIX={red_pixels} RMAX={peak_red}"
+                    ),
+                    (20, 130),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    (255, 255, 255),
+                    2
+                )
+
+                cv2.putText(
+                    frame,
+                    f"RX: {laser_decoder.status}",
+                    (20, 158),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    (255, 255, 255),
+                    2
+                )
 
             # ====================================================
             # ПОСАДОЧНАЯ ЗОНА: ОРАНЖЕВЫЙ КРУГ С БЕЛОЙ "Н"
@@ -497,7 +1227,7 @@ def video_worker():
             cv2.rectangle(
                 frame,
                 (10, 10),
-                (410, 105),
+                (500, 130),
                 (0, 0, 0),
                 -1
             )
@@ -535,6 +1265,20 @@ def video_worker():
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.60,
                 (0, 255, 255),
+                2
+            )
+
+            cv2.putText(
+                frame,
+                f"DETECT: {detection_mode}",
+                (20, 120),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.52,
+                (
+                    (0, 180, 255)
+                    if target_from_memory
+                    else (255, 255, 255)
+                ),
                 2
             )
 
@@ -610,7 +1354,7 @@ def calculate_flight_time(x, y, z, speed=FLIGHT_SPEED):
 
     pos = pioneer.get_local_position_lps()
 
-    if not pos or len(pos) < 3:
+    if pos is None or len(pos) < 3:
         return MIN_FLIGHT_TIME
 
     dx = x - pos[0]
@@ -748,7 +1492,7 @@ def stop_at_current_position():
     """
     pos = pioneer.get_local_position_lps()
 
-    if not pos or len(pos) < 3:
+    if pos is None or len(pos) < 3:
         return
 
     x, y, z = pos[:3]
@@ -778,9 +1522,10 @@ def center_over_target():
     """
     Плавное центрирование над ArUco с P-регулятором.
 
-    Чем ближе маркер к центру кадра, тем меньше скорость.
-    Координаты маркера дополнительно сглаживаются, чтобы
-    уменьшить дрожание от шума детектора.
+    Если ArUco кратковременно пропадает из кадра, дрон не замирает
+    сразу, а продолжает медленно лететь в направлении последней
+    корректирующей команды. Это помогает повторно захватить метку,
+    если она ушла за край кадра.
     """
 
     print("[CENTER] Начинаю плавное центрирование")
@@ -794,8 +1539,17 @@ def center_over_target():
     filtered_x = None
     filtered_y = None
 
+    # Последняя ненулевая команда движения к метке.
+    # При временной потере ArUco будем продолжать её с меньшей скоростью.
+    last_recovery_vx = 0.0
+    last_recovery_vy = 0.0
+    marker_was_visible = True
+
     def clamp(value, low, high):
         return max(low, min(high, value))
+
+    def clamp_abs(value, max_abs):
+        return clamp(value, -max_abs, max_abs)
 
     def speed_from_error(error_px):
         abs_error = abs(error_px)
@@ -815,7 +1569,22 @@ def center_over_target():
     while True:
         now = time.time()
 
+        received_digit = get_received_laser_digit()
+        if received_digit is not None:
+            pioneer.set_manual_speed_body_fixed(
+                vx=0.0, vy=0.0, vz=0.0, yaw_rate=0.0
+            )
+            stop_at_current_position()
+            print(
+                f"[CENTER] Получен лазерный сигнал {received_digit}. "
+                "Центрирование немедленно прервано."
+            )
+            return received_digit
+
         if now - started > CENTER_TIMEOUT:
+            pioneer.set_manual_speed_body_fixed(
+                vx=0.0, vy=0.0, vz=0.0, yaw_rate=0.0
+            )
             raise CenteringError(
                 "Не удалось отцентрироваться над ArUco "
                 "за отведённое время"
@@ -829,22 +1598,53 @@ def center_over_target():
             or frame_size is None
         ):
             stable_since = None
+            lost_for = now - marker_last_seen
+
+            if lost_for > MARKER_LOST_TIMEOUT:
+                pioneer.set_manual_speed_body_fixed(
+                    vx=0.0, vy=0.0, vz=0.0, yaw_rate=0.0
+                )
+                raise CenteringError(
+                    f"ArUco потерян более {MARKER_LOST_TIMEOUT:.1f} с"
+                )
+
+            # Продолжаем двигаться туда, куда только что корректировались,
+            # но медленнее и с ограничением максимальной скорости.
+            recovery_vx = clamp_abs(
+                last_recovery_vx * LOST_MARKER_SPEED_FACTOR,
+                LOST_MARKER_MAX_SPEED
+            )
+            recovery_vy = clamp_abs(
+                last_recovery_vy * LOST_MARKER_SPEED_FACTOR,
+                LOST_MARKER_MAX_SPEED
+            )
+
+            if marker_was_visible:
+                print(
+                    f"[CENTER LOST] ArUco временно потерян. "
+                    f"Продолжаю в последнюю сторону: "
+                    f"vx={recovery_vx:+.3f}, vy={recovery_vy:+.3f}"
+                )
+            marker_was_visible = False
 
             pioneer.set_manual_speed_body_fixed(
-                vx=0.0,
-                vy=0.0,
+                vx=recovery_vx,
+                vy=recovery_vy,
                 vz=0.0,
                 yaw_rate=0.0
             )
 
-            if now - marker_last_seen > MARKER_LOST_TIMEOUT:
-                raise CenteringError(
-                    "ArUco потерян во время центрирования"
-                )
-
-            time.sleep(0.05)
+            time.sleep(0.06)
             continue
 
+        # Маркер снова появился. После потери лучше начать фильтрацию заново,
+        # чтобы старые координаты не тянули управление в неверную сторону.
+        if not marker_was_visible:
+            print("[CENTER] ArUco снова найден")
+            filtered_x = None
+            filtered_y = None
+
+        marker_was_visible = True
         marker_last_seen = now
 
         marker_x_px, marker_y_px = center
@@ -892,7 +1692,7 @@ def center_over_target():
             if now - stable_since >= CENTER_STABLE_TIME:
                 print("[CENTER] Центрирование завершено")
                 stop_at_current_position()
-                return
+                return get_received_laser_digit()
 
             time.sleep(0.05)
             continue
@@ -905,6 +1705,12 @@ def center_over_target():
         # По вертикали кадра оставляем знак как в исходной версии:
         # маркер ниже центра -> движение назад.
         vy = -speed_from_error(error_y)
+
+        # Запоминаем последнее направление только когда команда ненулевая.
+        # По нему будем осторожно продолжать движение при потере изображения.
+        if abs(vx) > 1e-6 or abs(vy) > 1e-6:
+            last_recovery_vx = vx
+            last_recovery_vy = vy
 
         print(
             f"[CENTER CMD] "
@@ -1135,7 +1941,7 @@ def return_to_landing_point_and_land(number=LANDING_POINT_NUMBER):
     # Удерживаем текущую позицию перед посадкой.
     hover_pos = pioneer.get_local_position_lps()
 
-    if hover_pos and len(hover_pos) >= 3:
+    if hover_pos is not None and len(hover_pos) >= 3:
         pioneer.go_to_local_point(
             x=hover_pos[0],
             y=hover_pos[1],
@@ -1224,6 +2030,7 @@ try:
 
     print("[FLIGHT] Взлёт")
     pioneer.takeoff()
+    # не добавлять wait_point() после взлёта, т.к. он не нужен
 
     print("[FLIGHT] Взлёт завершён")
 
@@ -1313,7 +2120,7 @@ try:
             "не найден за один проход."
         )
         print("[SEARCH] Поиск завершён. Возврат домой.")
-        return_home_and_land()
+        return_to_landing_point_and_land(LANDING_POINT_NUMBER)
 
     else:
         # ----------------------------------------------------
@@ -1322,45 +2129,57 @@ try:
 
         print("[SEARCH] Маршрут поиска остановлен")
 
+        start_laser_receiver()
+
         try:
-            center_over_target()
+            received_digit = center_over_target()
 
         except CenteringError as e:
             print()
             print("[CENTER ERROR]", e)
-            print("[SAFETY] Центрирование не удалось. Возврат на старт.")
-            return_home_and_land()
+            received_digit = get_received_laser_digit()
 
-        else:
-            # ------------------------------------------------
-            # 6. Зависание
-            # ------------------------------------------------
-
-            print(
-                f"[HOVER] Зависание над меткой "
-                f"{HOVER_TIME:.1f} секунд"
-            )
-
-            hover_pos = pioneer.get_local_position_lps()
-
-            if hover_pos:
-                pioneer.go_to_local_point(
-                    x=hover_pos[0],
-                    y=hover_pos[1],
-                    z=SEARCH_HEIGHT,
-                    yaw=YAW,
-                    time=MIN_FLIGHT_TIME
+            if received_digit is None:
+                print(
+                    "[LASER RX] Сигнал 0..8 не получен. "
+                    "Использую посадочную зону №1."
+                )
+                selected_landing_number = 1
+            else:
+                selected_landing_number = landing_number_from_signal(
+                    received_digit
                 )
 
-            time.sleep(HOVER_TIME)
+            stop_laser_receiver()
+            return_to_landing_point_and_land(selected_landing_number)
 
-            # --------------------------------------------
-            # 7. К выбранной посадочной точке
-            # --------------------------------------------
+        else:
+            stop_laser_receiver()
 
-            return_to_landing_point_and_land(
-                LANDING_POINT_NUMBER
-            )
+            # После успешной центровки используем принятый сигнал.
+            # Если сигнала нет, по условию выбираем зону №1.
+            if received_digit is None:
+                received_digit = get_received_laser_digit()
+
+            if received_digit is None:
+                selected_landing_number = 1
+                print(
+                    "[LASER RX] Сигнал 0..8 не получен. "
+                    "Использую посадочную зону №1."
+                )
+            else:
+                selected_landing_number = landing_number_from_signal(
+                    received_digit
+                )
+                print(
+                    f"[LASER RX] Число {received_digit} -> "
+                    f"посадочная зона №{selected_landing_number}"
+                )
+
+            # Если сигнал уже принят, центрирование было прервано сразу.
+            # Дополнительное зависание над ArUco не требуется.
+            return_to_landing_point_and_land(selected_landing_number)
+
 
 
 except KeyboardInterrupt:
@@ -1402,6 +2221,7 @@ except Exception as e:
 
 finally:
 
+    stop_laser_receiver()
     running = False
 
     if video_thread is not None:

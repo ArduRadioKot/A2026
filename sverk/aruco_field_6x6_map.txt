@@ -1,0 +1,14 @@
+# ArUco map for a 6 x 6 field of 0.80 m cells.
+# Coordinate origin: lower-left corner of cell (1;1).
+# X increases to the right (column number); Y increases upward (row number).
+# Every marker is centered in its cell, lies in the Z=0 plane, and is 0.25 m square.
+# id    length  x       y       z       rot_z   rot_y   rot_x
+50      0.25    0.400   0.400   0.000   0.000   0.000   0.000
+64      0.25    2.000   4.400   0.000   0.000   0.000   0.000
+7       0.25    4.400   0.400   0.000   0.000   0.000   0.000
+51      0.25    2.000   1.200   0.000   0.000   0.000   0.000
+60      0.25    2.000   2.800   0.000   0.000   0.000   0.000
+62      0.25    4.400   4.400   0.000   0.000   0.000   0.000
+1       0.25    0.400   3.600   0.000   0.000   0.000   0.000
+81      0.25    0.400   2.000   0.000   0.000   0.000   0.000
+61      0.25    3.600   2.800   0.000   0.000   0.000   0.000
